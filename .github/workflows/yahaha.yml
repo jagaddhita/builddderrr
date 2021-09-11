@@ -1,0 +1,160 @@
+name: ROM Compile
+
+on:
+  #  release:
+  #    types: [published]
+  #  push:
+  #    branches:
+  #      - master
+  #    paths:
+  #      - '.config'
+  #  schedule:
+  #    - cron: 0 8 * * 5
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+  # watch:
+  #   types: [started]
+
+env:
+  ROM_name: ProjectSakura
+  ROM_ver: ProjectSakura-5.2
+  ROM_url: https://github.com/ProjectSakura/android.git -b 11
+  device: ulysse
+  DT_url: https://github.com/mi-msm8937/android_device_xiaomi_ulysse -b lineage-18.1
+  DT_path: device/xiaomi/ulysse
+  DT-common_url: https://github.com/mgs28-mh/device_xiaomi_ulysse-common -b eleven
+  DT-common_path: device/xiaomi/ulysse-common
+  VT_url: https://github.com/mi-msm8937/proprietary_vendor_xiaomi_ulysse -b lineage-18.1
+  VT_path: vendor/xiaomi/ulysse
+  KT_url: https://github.com/mgs28-mh/kernel_xiaomi_ulysse-4.9 -b 11
+  KT_path: kernel/xiaomi/ulysse
+  target: sepolicy
+  WorkSpace: WorkSpace
+  TZ: Asia/Jakarta
+  Enable_ccache: true
+  Delete_old: false
+
+jobs:
+  build:
+    runs-on: ubuntu-18.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@master
+
+      - name: Delete old environment
+        # if: env.Enable_cache == 'true' && !cancelled()
+        run: |
+          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d
+          docker rmi `docker images -q`
+          sudo -E apt-get -y purge azure-cli ghc* zulu* hhvm llvm* firefox google* dotnet* powershell openjdk* mysql* php*
+      - name: Enabling swapfile
+        run: |
+          sudo fallocate -l 20G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+      - name: Initializing environment
+        run: |
+          sudo -E apt-get clean
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install curl libstdc++6 git wget repo rsync aria2
+          git clone https://github.com/akhilnarang/scripts --depth=1 --single-branch
+          cd scripts
+          sudo -E bash setup/android_build_env.sh
+          sudo -E bash setup/install_android_sdk.sh
+      - name: Sync rom
+        run: |
+          mkdir WorkSpace
+          cd WorkSpace
+          repo init -u ${{env.ROM_url}} --depth=1 --groups=all,-notdefault,-device,-darwin,-x86,-mips
+          repo sync --current-branch --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune -j$(nproc --all)
+      - name: Sync device tree
+        run: |
+          cd ${{env.WorkSpace}}
+          git clone ${{ env.DT_url }} --depth=1 --single-branch ${{ env.DT_path }}
+      - name: Sync common device tree
+        run: |
+          cd ${{env.WorkSpace}}
+          git clone ${{ env.DT-common_url }} --depth=1 --single-branch ${{ env.DT-common_path }}
+      - name: Sync kernel tree
+        run: |
+          cd ${{env.WorkSpace}}
+          git clone ${{ env.KT_url }} --depth=1 --single-branch ${{ env.KT_path }}
+      - name: Sync vendor tree
+        run: |
+          cd ${{env.WorkSpace}}
+          git clone ${{ env.VT_url }} --depth=1 --single-branch ${{ env.VT_path }}
+
+      - name: Restore cache
+        uses: actions/cache@v2
+        if: env.Enable_cache == 'true' && !cancelled()
+        with:
+          path: |
+            ~/.ccache
+            ${{env.WorkSpace}}/out
+          key: ${{ runner.os }}-${{env.ROM_name}}-${{env.ROM_ver}}-${{ env.device }} #${{ hashFiles('**/BoardConfig.mk') }}
+          restore-keys: |
+            ${{ runner.os }}-${{env.ROM_name}}-${{env.ROM_ver}}-${{ env.device }}
+      - name: Setup ccache
+        uses: alexjurkiewicz/setup-ccache@master
+        if: env.Enable_ccache == 'true' && !cancelled()
+        with:
+          max-size: 5G
+          extra-config: |
+            keep_comments_cpp = true
+      - name: Building ${{env.ROM_name}}
+        run: |
+          cd ${{env.WorkSpace}}
+          . build/envsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          lunch lineage_${{ env.device }}-userdebug
+          mka bacon -jx
+        shell: bash
+
+      - name: Get info
+        id: info
+        run: |
+          echo "::set-output name=date::$(/bin/date -u "+%Y-%m-%d-%H-%M")"
+          echo "::set-output name=OutFolder::"${{env.WorkSpace}}/out/target/product/${{ env.device }}""
+        shell: bash
+
+      - name: Show out tree
+        run: |
+          cd ${{steps.info.outputs.OutFolder}}
+          sudo zip -r9 test.zip test.img
+          tree -C -L 5
+      - name: Upload firmware directory
+        uses: actions/upload-artifact@main
+        # if: steps.organize.outputs.status == 'success' && !cancelled()
+        with:
+          name: ${{env.Rec_name}}_for_${{ env.device }}-${{ github.run_id }}
+          path: ${{steps.info.outputs.OutFolder}}/*.img
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            ${{steps.info.outputs.OutFolder}}/*.zip
+            ${{steps.info.outputs.OutFolder}}/recovery.img
+          name: ${{env.ROM_name}}-${{ env.device }}-${{ github.run_id }}
+          tag_name: ${{ env.device }}-${{env.ROM_name}}-${{ steps.info.outputs.date }}
+          body: ${{env.ROM_name}}-${{env.ROM_ver}} for ${{ env.device }} build at ${{ steps.info.outputs.date }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Remove old Releases
+        uses: dev-drprasad/delete-older-releases@v0.1.0
+        if: env.Delete_old == 'true' && !cancelled()
+        with:
+          keep_latest: 12
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete workflow runs
+        uses: GitRML/delete-workflow-runs@main
+        if: env.Delete_old == 'true' && !cancelled()
+        with:
+          retain_days: 1
+          keep_minimum_runs: 10
